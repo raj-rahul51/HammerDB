@@ -59,6 +59,22 @@ proc CreateStoredProcs { maria_handler } {
         set update_returning true
     }
     catch { mariaexec $maria_handler "DROP PROCEDURE IF EXISTS `HDB_UPDATE_RETURNING_TEST`" }
+    #JSON_TABLE is available from MariaDB 10.6, use set based New Order if supported
+    set json_table_test {
+        CREATE PROCEDURE `HDB_JSON_TABLE_TEST` ()
+        BEGIN
+        DECLARE test_cnt INTEGER;
+        SELECT COUNT(jt.i) INTO test_cnt
+        FROM JSON_TABLE(JSON_ARRAY_APPEND(JSON_ARRAY(), '$', JSON_OBJECT('i', 1)), '$[*]' COLUMNS(i INT PATH '$.i')) AS jt;
+        END
+    }
+    catch { mariaexec $maria_handler "DROP PROCEDURE IF EXISTS `HDB_JSON_TABLE_TEST`" }
+    if { [ catch { mariaexec $maria_handler $json_table_test } ] } {
+        set json_table false
+    } else {
+        set json_table true
+    }
+    catch { mariaexec $maria_handler "DROP PROCEDURE IF EXISTS `HDB_JSON_TABLE_TEST`" }
     set sql(1) {
         CREATE PROCEDURE `NEWORD` (
         no_w_id    INTEGER,
@@ -141,7 +157,7 @@ proc CreateStoredProcs { maria_handler } {
         SELECT s_quantity, s_data, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10
         INTO no_s_quantity, no_s_data, no_s_dist_01, no_s_dist_02, no_s_dist_03, no_s_dist_04, no_s_dist_05, no_s_dist_06, no_s_dist_07, no_s_dist_08, no_s_dist_09, no_s_dist_10
         FROM stock WHERE s_i_id = no_ol_i_id AND s_w_id = no_ol_supply_w_id;
-        IF ( no_s_quantity > no_ol_quantity )
+        IF ( no_s_quantity >= no_ol_quantity + 10 )
         THEN
         SET no_s_quantity = ( no_s_quantity - no_ol_quantity );
         ELSE
@@ -182,6 +198,106 @@ proc CreateStoredProcs { maria_handler } {
         COMMIT;
         END 
     }
+    if { $json_table } {
+        #Set based New Order modelled on the PostgreSQL array_agg/UNNEST version
+        #JSON_ARRAY_APPEND builds the order lines, the order_line insert joins item for the prices
+        #JSON_TABLE exposes the JSON arrays as rows for the stock update and order_line insert
+        set sql(1) {
+        CREATE PROCEDURE `NEWORD` (
+        no_w_id    INTEGER,
+        no_max_w_id    INTEGER,
+        no_d_id    INTEGER,
+        no_c_id    INTEGER,
+        no_o_ol_cnt    INTEGER,
+        OUT no_c_discount   DECIMAL(4,4),
+        OUT no_c_last     VARCHAR(16),
+        OUT no_c_credit     VARCHAR(2),
+        OUT no_d_tax     DECIMAL(4,4),
+        OUT no_w_tax     DECIMAL(4,4),
+        INOUT no_d_next_o_id   INTEGER,
+        IN timestamp     DATETIME
+        )
+        BEGIN
+        DECLARE no_ol_supply_w_id  INTEGER;
+        DECLARE no_ol_i_id    INTEGER;
+        DECLARE no_ol_quantity     INTEGER;
+        DECLARE no_o_all_local     INTEGER;
+        DECLARE o_id       INTEGER;
+        DECLARE order_line_json    JSON;
+        DECLARE x        INTEGER;
+        DECLARE rbk           INTEGER;
+        DECLARE loop_counter    INT;
+        DECLARE `Constraint Violation` CONDITION FOR SQLSTATE '23000';
+        DECLARE EXIT HANDLER FOR `Constraint Violation` ROLLBACK;
+        DECLARE EXIT HANDLER FOR NOT FOUND ROLLBACK;
+        SET no_o_all_local = 1;
+        SELECT c_discount, c_last, c_credit, w_tax
+        INTO no_c_discount, no_c_last, no_c_credit, no_w_tax
+        FROM customer, warehouse
+        WHERE warehouse.w_id = no_w_id AND customer.c_w_id = no_w_id AND
+        customer.c_d_id = no_d_id AND customer.c_id = no_c_id;
+        -- #2.4.1.4 #2.4.1.5 build the order lines as a JSON array before locking the district
+        SET order_line_json = JSON_ARRAY();
+        SET rbk = FLOOR(1 + (RAND() * 99));
+        SET loop_counter = 1;
+        WHILE loop_counter <= no_o_ol_cnt DO
+        IF ((loop_counter = no_o_ol_cnt) AND (rbk = 1))
+        THEN
+        SET no_ol_i_id = 100001;
+        ELSE
+        SET no_ol_i_id = FLOOR(1 + (RAND() * 100000));
+        END IF;
+        SET x = FLOOR(1 + (RAND() * 100));
+        IF ( x > 1 )
+        THEN
+        SET no_ol_supply_w_id = no_w_id;
+        ELSE
+        SET no_ol_supply_w_id = no_w_id;
+        SET no_o_all_local = 0;
+        WHILE ((no_ol_supply_w_id = no_w_id) AND (no_max_w_id != 1)) DO
+        SET no_ol_supply_w_id = FLOOR(1 + (RAND() * no_max_w_id));
+        END WHILE;
+        END IF;
+        SET no_ol_quantity = FLOOR(1 + (RAND() * 10));
+        SET order_line_json = JSON_ARRAY_APPEND(order_line_json, '$',
+        JSON_OBJECT('n', loop_counter, 'i', no_ol_i_id, 'w', no_ol_supply_w_id, 'q', no_ol_quantity));
+        set loop_counter = loop_counter + 1;
+        END WHILE;
+        START TRANSACTION;
+        SELECT d_next_o_id, d_tax INTO no_d_next_o_id, no_d_tax
+        FROM district
+        WHERE d_id = no_d_id AND d_w_id = no_w_id FOR UPDATE;
+        UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_id = no_d_id AND d_w_id = no_w_id;
+        SET o_id = no_d_next_o_id;
+        INSERT INTO orders (o_id, o_d_id, o_w_id, o_c_id, o_entry_d, o_ol_cnt, o_all_local) VALUES (o_id, no_d_id, no_w_id, no_c_id, timestamp, no_o_ol_cnt, no_o_all_local);
+        INSERT INTO new_order (no_o_id, no_d_id, no_w_id) VALUES (o_id, no_d_id, no_w_id);
+        -- #2.4.2.2 s_quantity is reduced unless within 10 of the order quantity when it is increased by 91
+        UPDATE stock
+        JOIN JSON_TABLE(order_line_json, '$[*]' COLUMNS(i INT PATH '$.i', w INT PATH '$.w', q INT PATH '$.q')) AS ol
+        ON stock.s_i_id = ol.i AND stock.s_w_id = ol.w
+        SET stock.s_quantity = CASE
+        WHEN stock.s_quantity >= ol.q + 10
+        THEN stock.s_quantity - ol.q
+        ELSE stock.s_quantity - ol.q + 91
+        END;
+        -- one order line per valid item, the price is read from item in the same statement
+        INSERT INTO order_line (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_dist_info)
+        SELECT o_id, no_d_id, no_w_id, ol.n, ol.i, ol.w, ol.q,
+        CAST(( ol.q * item.i_price * ( 1 + no_w_tax + no_d_tax ) * ( 1 - no_c_discount ) ) AS DECIMAL(6,2)),
+        ELT(no_d_id, stock.s_dist_01, stock.s_dist_02, stock.s_dist_03, stock.s_dist_04, stock.s_dist_05, stock.s_dist_06, stock.s_dist_07, stock.s_dist_08, stock.s_dist_09, stock.s_dist_10)
+        FROM JSON_TABLE(order_line_json, '$[*]' COLUMNS(n INT PATH '$.n', i INT PATH '$.i', w INT PATH '$.w', q INT PATH '$.q')) AS ol
+        JOIN item ON item.i_id = ol.i
+        JOIN stock ON stock.s_i_id = ol.i AND stock.s_w_id = ol.w;
+        -- #2.4.2.3 an unused item has no item row, so fewer order lines are inserted and the
+        -- whole transaction rolls back through the NOT FOUND handler
+        IF ( ROW_COUNT() < no_o_ol_cnt )
+        THEN
+        SIGNAL SQLSTATE '02000' SET MESSAGE_TEXT = 'Item number is not valid';
+        END IF;
+        COMMIT;
+        END
+        }
+    }
     if { $update_returning } {
         set sql(1) [ string map [ list \
             {        SELECT d_next_o_id, d_tax INTO no_d_next_o_id, no_d_tax
@@ -194,7 +310,7 @@ proc CreateStoredProcs { maria_handler } {
             {        SELECT s_quantity, s_data, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10
         INTO no_s_quantity, no_s_data, no_s_dist_01, no_s_dist_02, no_s_dist_03, no_s_dist_04, no_s_dist_05, no_s_dist_06, no_s_dist_07, no_s_dist_08, no_s_dist_09, no_s_dist_10
         FROM stock WHERE s_i_id = no_ol_i_id AND s_w_id = no_ol_supply_w_id;
-        IF ( no_s_quantity > no_ol_quantity )
+        IF ( no_s_quantity >= no_ol_quantity + 10 )
         THEN
         SET no_s_quantity = ( no_s_quantity - no_ol_quantity );
         ELSE
@@ -205,7 +321,7 @@ proc CreateStoredProcs { maria_handler } {
         AND s_w_id = no_ol_supply_w_id;} \
             {        UPDATE stock
         SET s_quantity = CASE
-        WHEN s_quantity > no_ol_quantity
+        WHEN s_quantity >= no_ol_quantity + 10
         THEN s_quantity - no_ol_quantity
         ELSE s_quantity - no_ol_quantity + 91
         END
@@ -1517,7 +1633,7 @@ proc insert_maria_no_stored_procs { testtype timedtype } {
       set quantity_data_dist [ maria::sel $maria_handler "SELECT s_quantity, s_data, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10 FROM stock WHERE s_i_id = $no_ol_i_id AND s_w_id = $no_ol_supply_w_id" -flatlist ]
       set no_i_price [ lindex $price_name_data 0 ]
       set no_s_quantity [ lindex $quantity_data_dist 0 ]
-      if { $no_s_quantity > $no_ol_quantity } {
+      if { $no_s_quantity >= [ expr {$no_ol_quantity + 10} ] } {
         set no_s_quantity [ expr {$no_s_quantity - $no_ol_quantity} ]
       } else {
         set no_s_quantity [ expr {$no_s_quantity - $no_ol_quantity + 91} ]
